@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <clocale>
+#include <cwchar>
 #include <ncurses.h>
 #include <alsa/asoundlib.h>
 #include <sixel.h>
@@ -33,6 +35,7 @@ namespace fs = std::filesystem;
 #ifndef APP_V
 #define APP_V "0.0.000"
 #endif
+
 enum class PlayMode : uint8_t {
     NORMAL = 0,
     LOOP = 1,
@@ -62,6 +65,58 @@ struct TrackMetadata {
     int cover_w = 0;
     int cover_h = 0;
 };
+
+static std::string truncate_utf8(const std::string& str, int max_cols) {
+    if (max_cols <= 0 || str.empty()) return "";
+
+    std::wstring wstr(str.size(), L'\0');
+    size_t converted = std::mbstowcs(&wstr[0], str.c_str(), str.size());
+    if (converted == static_cast<size_t>(-1)) {
+        std::string res;
+        int cols = 0;
+        for (char c : str) {
+            if ((static_cast<unsigned char>(c) & 0xC0) != 0x80) {
+                if (cols >= max_cols) break;
+                cols++;
+            }
+            res += c;
+        }
+        return res;
+    }
+    wstr.resize(converted);
+
+    int cur_cols = 0;
+    size_t char_count = 0;
+    for (wchar_t wc : wstr) {
+        int w = wcwidth(wc);
+        if (w < 0) w = 0;
+        if (cur_cols + w > max_cols) break;
+        cur_cols += w;
+        char_count++;
+    }
+
+    wstr.resize(char_count);
+    std::string out(wstr.size() * 4 + 1, '\0');
+    size_t back_len = std::wcstombs(&out[0], wstr.c_str(), out.size());
+    if (back_len == static_cast<size_t>(-1)) return "";
+    out.resize(back_len);
+    return out;
+}
+
+static int utf8_display_width(const std::string& str) {
+    if (str.empty()) return 0;
+    std::wstring wstr(str.size(), L'\0');
+    size_t converted = std::mbstowcs(&wstr[0], str.c_str(), str.size());
+    if (converted == static_cast<size_t>(-1)) {
+        return static_cast<int>(str.length());
+    }
+    int cols = 0;
+    for (size_t i = 0; i < converted; ++i) {
+        int w = wcwidth(wstr[i]);
+        if (w > 0) cols += w;
+    }
+    return cols;
+}
 
 static int sixel_write_callback(char* data, int size, void* priv) {
     auto* buf = static_cast<std::string*>(priv);
@@ -523,7 +578,7 @@ public:
 
     void scan() {
         entries.clear();
-        if (path.has_parent_path()) {
+        if (path.has_parent_path() && path != path.parent_path()) {
             entries.push_back({ "..", (path / "..").lexically_normal().string(), 1, 0, 0 });
         }
 
@@ -683,19 +738,37 @@ public:
 
     void draw_entry_line(int y, int entry_idx, int split_x, bool is_selected) {
         move(y, 0);
+        if (split_x <= 0) return;
+
         if (entry_idx >= 0 && entry_idx < static_cast<int>(entries.size())) {
             const auto& item = entries[entry_idx];
             if (is_selected) attron(COLOR_PAIR(1) | A_REVERSE);
             else attron(COLOR_PAIR(1));
 
             char prefix = item.is_dir ? '/' : ' ';
-            mvprintw(y, 0, " %c%-*.*s", prefix, split_x - 3, split_x - 3, item.name.c_str());
+            int max_text_cols = std::max(0, split_x - 3);
+            std::string disp_name = truncate_utf8(item.name, max_text_cols);
+            int disp_w = utf8_display_width(disp_name);
+            int pad = std::max(0, split_x - 2 - disp_w);
+
+            mvprintw(y, 0, " %c%s%*s", prefix, disp_name.c_str(), pad, "");
 
             if (is_selected) attroff(COLOR_PAIR(1) | A_REVERSE);
             else attroff(COLOR_PAIR(1));
         } else {
             mvprintw(y, 0, "%*s", split_x, "");
         }
+    }
+
+    void draw_meta_line(int& meta_y, int split_x, int side_w, int max_y, const char* label, const std::string& val) {
+        if (meta_y >= max_y - 2) return;
+        move(meta_y, split_x + 2);
+        clrtoeol();
+        mvaddch(meta_y, split_x, ACS_VLINE);
+        int val_max_cols = std::max(0, side_w - 10);
+        std::string val_str = truncate_utf8(val, val_max_cols);
+        mvprintw(meta_y, split_x + 2, "%-8s %s", label, val_str.c_str());
+        meta_y++;
     }
 
     void draw_status(AudioEngine& audio, int max_x, int y) {
@@ -720,7 +793,8 @@ public:
                      sec_to_str(audio.cur_pts.load()).c_str(),
                      sec_to_str(audio.duration.load()).c_str(), vol, spd);
         }
-        mvprintw(y, 1, "%.*s", max_x - 3, stat_buf);
+        std::string safe_stat = truncate_utf8(stat_buf, std::max(0, max_x - 3));
+        mvprintw(y, 1, "%s", safe_stat.c_str());
         attroff(COLOR_PAIR(1) | A_REVERSE);
     }
 
@@ -729,7 +803,8 @@ public:
         clrtoeol();
 
         if (is_searching) {
-            mvprintw(y, 1, "/%s", search_query.c_str());
+            std::string disp_query = truncate_utf8(search_query, std::max(0, max_x - 4));
+            mvprintw(y, 1, "/%s", disp_query.c_str());
         } else {
             double dur = audio.duration.load();
             double ratio = (dur > 0.0) ? std::clamp(audio.cur_pts.load() / dur, 0.0, 1.0) : 0.0;
@@ -749,9 +824,6 @@ public:
         }
     }
 
-    // ------------------------------------------------------------------
-    // Full structural render
-    // ------------------------------------------------------------------
     void render_full(AudioEngine& audio) {
         int max_y, max_x;
         getmaxyx(stdscr, max_y, max_x);
@@ -779,10 +851,12 @@ public:
         attron(COLOR_PAIR(1) | A_REVERSE);
         move(0, 0);
         clrtoeol();
-        mvprintw(0, 1, "Browser: %-.*s", max_x - 11, path.string().c_str());
+        int max_header_cols = std::max(0, max_x - 11);
+        std::string header_path = truncate_utf8(path.string(), max_header_cols);
+        mvprintw(0, 1, "Browser: %s", header_path.c_str());
         attroff(COLOR_PAIR(1) | A_REVERSE);
 
-        // 2. Left panel – full list
+        // 2. Left panel - full list
         for (int i = 0; i < view_h; ++i) {
             int entry_idx = scroll + i;
             draw_entry_line(i + 1, entry_idx, split_x, entry_idx == idx);
@@ -790,7 +864,7 @@ public:
         last_idx = idx;
         last_scroll = scroll;
 
-        // Vertical divider & Full clear of right panel to prevent dialog marks
+        // Vertical divider & Full clear of right panel
         for (int y = 1; y < max_y - 2; ++y) {
             move(y, split_x + 1);
             clrtoeol();
@@ -815,25 +889,14 @@ public:
             audio.metadata_updated = false;
         }
 
-        // Render metadata strictly at the bottom
         int meta_y = g.meta_y;
-        auto draw_meta_line = [&](const char* label, const std::string& val) {
-            if (meta_y >= max_y - 2) return;
-            move(meta_y, split_x + 2);
-            clrtoeol();
-            mvaddch(meta_y, split_x, ACS_VLINE);
-            mvprintw(meta_y, split_x + 2, "%-8s %.*s",
-                     label, std::max(0, g.side_w - 9), val.c_str());
-            meta_y++;
-        };
-
-        draw_meta_line("Title:",  meta.title.empty()  ? "(none)" : meta.title);
-        draw_meta_line("Artist:", meta.artist.empty() ? "(none)" : meta.artist);
-        draw_meta_line("Album:",  meta.album.empty()  ? "(none)" : meta.album);
-        draw_meta_line("Codec:",  meta.codec_name);
-        draw_meta_line("Rate:",   std::to_string(meta.sample_rate) + " Hz");
-        draw_meta_line("Bitrate:",std::to_string(meta.bit_rate / 1000) + " kb/s");
-        draw_meta_line("Ch:",     std::to_string(meta.channels));
+        draw_meta_line(meta_y, split_x, g.side_w, max_y, "Title:",   meta.title.empty()  ? "(none)" : meta.title);
+        draw_meta_line(meta_y, split_x, g.side_w, max_y, "Artist:",  meta.artist.empty() ? "(none)" : meta.artist);
+        draw_meta_line(meta_y, split_x, g.side_w, max_y, "Album:",   meta.album.empty()  ? "(none)" : meta.album);
+        draw_meta_line(meta_y, split_x, g.side_w, max_y, "Codec:",   meta.codec_name);
+        draw_meta_line(meta_y, split_x, g.side_w, max_y, "Rate:",    std::to_string(meta.sample_rate) + " Hz");
+        draw_meta_line(meta_y, split_x, g.side_w, max_y, "Bitrate:", std::to_string(meta.bit_rate / 1000) + " kb/s");
+        draw_meta_line(meta_y, split_x, g.side_w, max_y, "Ch:",      std::to_string(meta.channels));
 
         // 4 + 5. Status + progress
         draw_status(audio, max_x, max_y - 2);
@@ -850,9 +913,6 @@ public:
         refresh();
     }
 
-    // ------------------------------------------------------------------
-    // Lightweight update path
-    // ------------------------------------------------------------------
     void render_light(AudioEngine& audio) {
         int max_y, max_x;
         getmaxyx(stdscr, max_y, max_x);
@@ -902,22 +962,13 @@ public:
             audio.metadata_updated = false;
 
             int meta_y = g.meta_y;
-            auto draw_meta_line = [&](const char* label, const std::string& val) {
-                if (meta_y >= max_y - 2) return;
-                move(meta_y, split_x + 2);
-                clrtoeol();
-                mvaddch(meta_y, split_x, ACS_VLINE);
-                mvprintw(meta_y, split_x + 2, "%-8s %.*s",
-                         label, std::max(0, g.side_w - 9), val.c_str());
-                meta_y++;
-            };
-            draw_meta_line("Title:",  meta.title.empty()  ? "(none)" : meta.title);
-            draw_meta_line("Artist:", meta.artist.empty() ? "(none)" : meta.artist);
-            draw_meta_line("Album:",  meta.album.empty()  ? "(none)" : meta.album);
-            draw_meta_line("Codec:",  meta.codec_name);
-            draw_meta_line("Rate:",   std::to_string(meta.sample_rate) + " Hz");
-            draw_meta_line("Bitrate:",std::to_string(meta.bit_rate / 1000) + " kb/s");
-            draw_meta_line("Ch:",     std::to_string(meta.channels));
+            draw_meta_line(meta_y, split_x, g.side_w, max_y, "Title:",   meta.title.empty()  ? "(none)" : meta.title);
+            draw_meta_line(meta_y, split_x, g.side_w, max_y, "Artist:",  meta.artist.empty() ? "(none)" : meta.artist);
+            draw_meta_line(meta_y, split_x, g.side_w, max_y, "Album:",   meta.album.empty()  ? "(none)" : meta.album);
+            draw_meta_line(meta_y, split_x, g.side_w, max_y, "Codec:",   meta.codec_name);
+            draw_meta_line(meta_y, split_x, g.side_w, max_y, "Rate:",    std::to_string(meta.sample_rate) + " Hz");
+            draw_meta_line(meta_y, split_x, g.side_w, max_y, "Bitrate:", std::to_string(meta.bit_rate / 1000) + " kb/s");
+            draw_meta_line(meta_y, split_x, g.side_w, max_y, "Ch:",      std::to_string(meta.channels));
         }
 
         if (show_help) {
@@ -942,7 +993,7 @@ public:
 
     void render_help_dialog(int max_y, int max_x) {
         int dlg_w = std::min(60, max_x - 4);
-        int dlg_h = std::min(21, max_y - 2);
+        int dlg_h = std::min(22, max_y - 2);
         int top_y = (max_y - dlg_h) / 2;
         int left_x = (max_x - dlg_w) / 2;
 
@@ -975,6 +1026,7 @@ public:
         };
 
         draw_help_item("Space", "Play / Enter Directory");
+        draw_help_item("Backspace", "Go to Parent Directory");
         draw_help_item("p / c", "Pause / Resume");
         draw_help_item("v", "Stop playback");
         draw_help_item("m", "Toggle Mute");
@@ -1186,6 +1238,20 @@ public:
                 running = false;
                 break;
 
+            case KEY_BACKSPACE:
+            case 127:
+            case '\b':
+                if (path.has_parent_path() && path != path.parent_path()) {
+                    try {
+                        path = fs::canonical(path.parent_path());
+                    } catch (...) {
+                        path = path.parent_path();
+                    }
+                    scan();
+                    need_redraw = true;
+                }
+                break;
+
             case KEY_UP: case 'k':
                 if (idx > 0) idx--;
                 need_status = true;
@@ -1306,6 +1372,7 @@ private:
 };
 
 int main() {
+    std::setlocale(LC_ALL, "");
     av_log_set_level(AV_LOG_QUIET);
 
     AudioEngine audio;
