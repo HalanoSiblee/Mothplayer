@@ -1,6 +1,7 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <sstream>
 #include <filesystem>
 #include <algorithm>
 #include <thread>
@@ -9,6 +10,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <cctype>
 #include <clocale>
 #include <cwchar>
 #include <ncurses.h>
@@ -33,7 +35,7 @@ namespace fs = std::filesystem;
 #endif
 
 #ifndef APP_V
-#define APP_V "0.0.000"
+#define APP_V "0.1.000"
 #endif
 
 enum class PlayMode : uint8_t {
@@ -42,15 +44,12 @@ enum class PlayMode : uint8_t {
     SEQUENTIAL = 2
 };
 
-#pragma pack(push, 1)
 struct FileItem {
     std::string name;
     std::string path;
-    uint8_t is_dir   : 1;
-    uint8_t is_audio : 1;
-    uint8_t reserved : 6;
+    bool is_dir = false;
+    bool is_audio = false;
 };
-#pragma pack(pop)
 
 struct TrackMetadata {
     std::string title;
@@ -66,8 +65,25 @@ struct TrackMetadata {
     int cover_h = 0;
 };
 
-static std::string truncate_utf8(const std::string& str, int max_cols) {
-    if (max_cols <= 0 || str.empty()) return "";
+static std::string truncate_utf8(const std::string& str, int max_cols, int* out_cols = nullptr) {
+    if (max_cols <= 0 || str.empty()) {
+        if (out_cols) *out_cols = 0;
+        return "";
+    }
+
+    bool is_ascii = true;
+    for (unsigned char c : str) {
+        if (c >= 0x80) {
+            is_ascii = false;
+            break;
+        }
+    }
+
+    if (is_ascii) {
+        int len = std::min(static_cast<int>(str.size()), max_cols);
+        if (out_cols) *out_cols = len;
+        return str.substr(0, len);
+    }
 
     std::wstring wstr(str.size(), L'\0');
     size_t converted = std::mbstowcs(&wstr[0], str.c_str(), str.size());
@@ -81,6 +97,7 @@ static std::string truncate_utf8(const std::string& str, int max_cols) {
             }
             res += c;
         }
+        if (out_cols) *out_cols = cols;
         return res;
     }
     wstr.resize(converted);
@@ -95,6 +112,7 @@ static std::string truncate_utf8(const std::string& str, int max_cols) {
         char_count++;
     }
 
+    if (out_cols) *out_cols = cur_cols;
     wstr.resize(char_count);
     std::string out(wstr.size() * 4 + 1, '\0');
     size_t back_len = std::wcstombs(&out[0], wstr.c_str(), out.size());
@@ -105,6 +123,16 @@ static std::string truncate_utf8(const std::string& str, int max_cols) {
 
 static int utf8_display_width(const std::string& str) {
     if (str.empty()) return 0;
+
+    bool is_ascii = true;
+    for (unsigned char c : str) {
+        if (c >= 0x80) {
+            is_ascii = false;
+            break;
+        }
+    }
+    if (is_ascii) return static_cast<int>(str.size());
+
     std::wstring wstr(str.size(), L'\0');
     size_t converted = std::mbstowcs(&wstr[0], str.c_str(), str.size());
     if (converted == static_cast<size_t>(-1)) {
@@ -116,6 +144,13 @@ static int utf8_display_width(const std::string& str) {
         if (w > 0) cols += w;
     }
     return cols;
+}
+
+static std::string trim_str(const std::string& s) {
+    size_t start = s.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return "";
+    size_t end = s.find_last_not_of(" \t\r\n");
+    return s.substr(start, end - start + 1);
 }
 
 static int sixel_write_callback(char* data, int size, void* priv) {
@@ -159,12 +194,13 @@ public:
     std::atomic<bool> is_playing{false};
     std::atomic<bool> is_paused{false};
     std::atomic<bool> is_muted{false};
+    std::atomic<bool> is_reverse{false};
     std::atomic<bool> stop_requested{false};
     std::atomic<bool> metadata_updated{false};
     std::atomic<bool> track_finished{false};
     std::atomic<double> seek_req{-1.0};
-    std::atomic<double> volume{1.0f};
-    std::atomic<double> speed{1.0f};
+    std::atomic<double> volume{1.0};
+    std::atomic<double> speed{1.0};
     std::atomic<double> cur_pts{0.0};
     std::atomic<double> duration{0.0};
 
@@ -190,6 +226,7 @@ public:
 
     ~AudioEngine() {
         stop_requested = true;
+        abort_decode = true;
         is_playing = false;
         if (pcm) snd_pcm_drop(pcm);
         if (worker.joinable()) worker.join();
@@ -204,15 +241,18 @@ public:
 
     void toggle_pause() { if (is_playing) is_paused = !is_paused; }
     void toggle_mute() { is_muted = !is_muted; }
+    void toggle_reverse() { is_reverse = !is_reverse; }
 
     void stop() {
         is_playing = false;
         is_paused = false;
+        abort_decode = true;
         ++cover_gen;
         if (pcm) snd_pcm_drop(pcm);
         {
             std::lock_guard<std::mutex> lk(meta_mutex);
             active_meta = TrackMetadata{};
+            last_played_path.clear();
             metadata_updated = true;
         }
     }
@@ -234,6 +274,7 @@ public:
         volume = 1.0;
         speed = 1.0;
         is_muted = false;
+        is_reverse = false;
     }
 
 private:
@@ -242,6 +283,12 @@ private:
     std::mutex cmd_mutex;
     std::string queued_path;
     bool track_switch = false;
+
+    std::vector<int16_t> pcm_data;
+    std::mutex pcm_mutex;
+    std::atomic<size_t> total_frames{0};
+    std::atomic<bool> decode_complete{false};
+    std::atomic<bool> abort_decode{false};
 
     void extract_album_art_async(const std::string& path, int target_w, int target_h, uint64_t my_gen) {
         AVFormatContext* fctx = nullptr;
@@ -274,15 +321,13 @@ private:
                         double scale = std::min(
                             static_cast<double>(target_w) / std::max(1, src_w),
                             static_cast<double>(target_h) / std::max(1, src_h));
-                        int out_w = std::max(1, static_cast<int>(src_w * scale));
-                        int out_h = std::max(1, static_cast<int>(src_h * scale));
-                        out_w &= ~1;
-                        out_h &= ~1;
+                        int out_w = std::max(1, static_cast<int>(src_w * scale)) & ~1;
+                        int out_h = std::max(1, static_cast<int>(src_h * scale)) & ~1;
                         if (out_w < 2) out_w = 2;
                         if (out_h < 2) out_h = 2;
 
                         SwsContext* sws = sws_getContext(
-                            src_w, src_h, (AVPixelFormat)vframe->format,
+                            src_w, src_h, static_cast<AVPixelFormat>(vframe->format),
                             out_w, out_h, AV_PIX_FMT_RGB24,
                             SWS_LANCZOS, nullptr, nullptr, nullptr);
                         if (sws) {
@@ -305,16 +350,147 @@ private:
         }
         avformat_close_input(&fctx);
 
-        if (my_gen != cover_gen.load() || last_played_path != path) return;
+        if (my_gen != cover_gen.load()) return;
 
         {
             std::lock_guard<std::mutex> lk(meta_mutex);
+            if (last_played_path != path) return;
             active_meta.sixel_art = std::move(sixel);
             active_meta.has_cover = has_cover;
             active_meta.cover_w = cover_out_w;
             active_meta.cover_h = cover_out_h;
             metadata_updated = true;
         }
+    }
+
+    void fill_pcm_buffer(const std::string& path) {
+        AVFormatContext* fctx = nullptr;
+        if (avformat_open_input(&fctx, path.c_str(), nullptr, nullptr) < 0) {
+            decode_complete = true;
+            return;
+        }
+        if (avformat_find_stream_info(fctx, nullptr) < 0) {
+            avformat_close_input(&fctx);
+            decode_complete = true;
+            return;
+        }
+
+        int audio_idx = -1;
+        for (unsigned int i = 0; i < fctx->nb_streams; ++i) {
+            if (fctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                audio_idx = i;
+                break;
+            }
+        }
+        if (audio_idx == -1) {
+            avformat_close_input(&fctx);
+            decode_complete = true;
+            return;
+        }
+
+        AVCodecParameters* par = fctx->streams[audio_idx]->codecpar;
+        const AVCodec* dec = avcodec_find_decoder(par->codec_id);
+        if (!dec) {
+            avformat_close_input(&fctx);
+            decode_complete = true;
+            return;
+        }
+
+        AVCodecContext* cctx = avcodec_alloc_context3(dec);
+        avcodec_parameters_to_context(cctx, par);
+        if (avcodec_open2(cctx, dec, nullptr) < 0) {
+            avcodec_free_context(&cctx);
+            avformat_close_input(&fctx);
+            decode_complete = true;
+            return;
+        }
+
+        const int out_rate = 44100;
+        SwrContext* swr = swr_alloc();
+        av_opt_set_chlayout(swr, "in_chlayout", &cctx->ch_layout, 0);
+        av_opt_set_int(swr, "in_sample_rate", cctx->sample_rate, 0);
+        av_opt_set_sample_fmt(swr, "in_sample_fmt", cctx->sample_fmt, 0);
+
+        AVChannelLayout out_ch;
+        av_channel_layout_default(&out_ch, 2);
+        av_opt_set_chlayout(swr, "out_chlayout", &out_ch, 0);
+        av_opt_set_int(swr, "out_sample_rate", out_rate, 0);
+        av_opt_set_sample_fmt(swr, "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
+        swr_init(swr);
+        av_channel_layout_uninit(&out_ch);
+
+        AVPacket* pkt = av_packet_alloc();
+        AVFrame* frm = av_frame_alloc();
+
+        std::vector<int16_t> temp_buf(out_rate * 2);
+        size_t temp_count = 0;
+        const size_t MAX_DECODE_FRAMES = 44100ULL * 7200ULL; // 2 hour max buffer limit
+
+        while (!abort_decode && !stop_requested) {
+            if (total_frames.load() >= MAX_DECODE_FRAMES) break;
+
+            int ret = av_read_frame(fctx, pkt);
+            if (ret < 0) break;
+
+            if (pkt->stream_index == audio_idx) {
+                if (avcodec_send_packet(cctx, pkt) == 0) {
+                    while (avcodec_receive_frame(cctx, frm) == 0) {
+                        int samples = av_rescale_rnd(swr_get_delay(swr, cctx->sample_rate) +
+                                                      frm->nb_samples, out_rate, cctx->sample_rate, AV_ROUND_UP);
+                        if (samples > 0) {
+                            if (temp_count + samples * 2 > temp_buf.size()) {
+                                temp_buf.resize(temp_count + samples * 2 + out_rate);
+                            }
+                            uint8_t* out_ptrs[1] = { reinterpret_cast<uint8_t*>(temp_buf.data() + temp_count) };
+                            int converted = swr_convert(swr, out_ptrs, samples,
+                                                        const_cast<const uint8_t**>(frm->extended_data), frm->nb_samples);
+                            if (converted > 0) {
+                                temp_count += converted * 2;
+                            }
+                        }
+                        if (temp_count >= 16384) {
+                            std::lock_guard<std::mutex> lk(pcm_mutex);
+                            pcm_data.insert(pcm_data.end(), temp_buf.begin(), temp_buf.begin() + temp_count);
+                            total_frames = pcm_data.size() / 2;
+                            temp_count = 0;
+                        }
+                    }
+                }
+            }
+            av_packet_unref(pkt);
+        }
+
+        if (!abort_decode && !stop_requested) {
+            avcodec_send_packet(cctx, nullptr);
+            while (avcodec_receive_frame(cctx, frm) == 0) {
+                int samples = av_rescale_rnd(swr_get_delay(swr, cctx->sample_rate) +
+                                              frm->nb_samples, out_rate, cctx->sample_rate, AV_ROUND_UP);
+                if (samples > 0) {
+                    if (temp_count + samples * 2 > temp_buf.size()) {
+                        temp_buf.resize(temp_count + samples * 2 + out_rate);
+                    }
+                    uint8_t* out_ptrs[1] = { reinterpret_cast<uint8_t*>(temp_buf.data() + temp_count) };
+                    int converted = swr_convert(swr, out_ptrs, samples,
+                                                const_cast<const uint8_t**>(frm->extended_data), frm->nb_samples);
+                    if (converted > 0) temp_count += converted * 2;
+                }
+            }
+        }
+
+        if (temp_count > 0) {
+            std::lock_guard<std::mutex> lk(pcm_mutex);
+            pcm_data.insert(pcm_data.end(), temp_buf.begin(), temp_buf.begin() + temp_count);
+            total_frames = pcm_data.size() / 2;
+            temp_count = 0;
+        }
+
+        av_frame_free(&frm);
+        av_packet_free(&pkt);
+        swr_free(&swr);
+        avcodec_free_context(&cctx);
+        avformat_close_input(&fctx);
+
+        decode_complete = true;
     }
 
     void run() {
@@ -331,7 +507,6 @@ private:
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 continue;
             }
-            last_played_path = path;
             decode_loop(path);
         }
     }
@@ -378,56 +553,49 @@ private:
 
         {
             std::lock_guard<std::mutex> lk(meta_mutex);
+            last_played_path = path;
             active_meta = local_meta;
             metadata_updated = true;
         }
 
-        duration = (fctx->duration != AV_NOPTS_VALUE) ? (double)fctx->duration / AV_TIME_BASE : 0.0;
+        duration = (fctx->duration != AV_NOPTS_VALUE) ? static_cast<double>(fctx->duration) / AV_TIME_BASE : 0.0;
 
-        std::string path_copy = path;
         uint64_t my_gen = ++cover_gen;
-        int tw = cover_target_w.load();
-        int th = cover_target_h.load();
-        if (tw < 48) tw = 48;
-        if (th < 48) th = 48;
-        if (tw > 400) tw = 400;
-        if (th > 400) th = 400;
-        std::thread([this, path_copy, my_gen, tw, th]() {
-            extract_album_art_async(path_copy, tw, th, my_gen);
+        int tw = std::clamp(cover_target_w.load(), 48, 400);
+        int th = std::clamp(cover_target_h.load(), 48, 400);
+
+        std::thread([this, path, my_gen, tw, th]() {
+            extract_album_art_async(path, tw, th, my_gen);
         }).detach();
 
-        SwrContext* swr = nullptr;
-        int out_rate = 44100;
-        double active_speed = speed.load();
+        avcodec_free_context(&cctx);
+        avformat_close_input(&fctx);
 
-        auto configure_swr = [&](double spd) {
-            if (swr) swr_free(&swr);
-            swr = swr_alloc();
-            int in_rate = static_cast<int>(std::round(cctx->sample_rate * spd));
-            av_opt_set_chlayout(swr, "in_chlayout", &cctx->ch_layout, 0);
-            av_opt_set_int(swr, "in_sample_rate", in_rate, 0);
-            av_opt_set_sample_fmt(swr, "in_sample_fmt", cctx->sample_fmt, 0);
+        abort_decode = false;
+        decode_complete = false;
+        total_frames = 0;
+        {
+            std::lock_guard<std::mutex> lk(pcm_mutex);
+            pcm_data.clear();
+        }
 
-            AVChannelLayout out_ch;
-            av_channel_layout_default(&out_ch, 2);
-            av_opt_set_chlayout(swr, "out_chlayout", &out_ch, 0);
-            av_opt_set_int(swr, "out_sample_rate", out_rate, 0);
-            av_opt_set_sample_fmt(swr, "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
-            swr_init(swr);
-            av_channel_layout_uninit(&out_ch);
-        };
+        std::thread dec_th(&AudioEngine::fill_pcm_buffer, this, path);
 
-        configure_swr(active_speed);
+        while (!decode_complete && total_frames.load() < 4096 && !abort_decode && !stop_requested) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
 
-        AVPacket* pkt = av_packet_alloc();
-        AVFrame* frm = av_frame_alloc();
         is_playing = true;
         is_paused = false;
 
-        int max_resample_buf = out_rate / 2;
-        std::vector<int16_t> audio_buf(max_resample_buf * 2);
+        double play_pos = 0.0;
+        if (is_reverse.load()) {
+            play_pos = total_frames.load() > 0 ? static_cast<double>(total_frames.load() - 1) : 0.0;
+        }
 
-        bool natural_eof = true;
+        const int CHUNK_FRAMES = 1024;
+        std::vector<int16_t> alsa_out(CHUNK_FRAMES * 2);
+        bool natural_eof = false;
 
         while (is_playing && !stop_requested) {
             {
@@ -445,72 +613,106 @@ private:
 
             double s = seek_req.exchange(-1.0);
             if (s >= 0.0) {
-                int64_t target_pts = static_cast<int64_t>(s / av_q2d(fctx->streams[audio_idx]->time_base));
-                av_seek_frame(fctx, audio_idx, target_pts, AVSEEK_FLAG_BACKWARD);
-                avcodec_flush_buffers(cctx);
+                play_pos = std::clamp(s * 44100.0, 0.0, static_cast<double>(total_frames.load()));
             }
 
-            double cur_spd = speed.load();
-            if (std::abs(cur_spd - active_speed) > 0.001) {
-                active_speed = cur_spd;
-                configure_swr(active_speed);
+            bool rev = is_reverse.load();
+            double spd = std::clamp(speed.load(), 0.10, 3.0);
+            double vol = is_muted.load() ? 0.0 : volume.load();
+
+            size_t tf = total_frames.load();
+            if (!rev) {
+                if (play_pos >= tf) {
+                    if (decode_complete) {
+                        natural_eof = true;
+                        break;
+                    } else {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                        continue;
+                    }
+                }
+            } else {
+                if (play_pos <= 0.0) {
+                    natural_eof = true;
+                    break;
+                }
             }
 
-            if (av_read_frame(fctx, pkt) < 0) break;
+            int frames_to_render = CHUNK_FRAMES;
+            int rendered = 0;
 
-            if (pkt->stream_index == audio_idx) {
-                if (avcodec_send_packet(cctx, pkt) == 0) {
-                    while (avcodec_receive_frame(cctx, frm) == 0) {
-                        if (frm->pts != AV_NOPTS_VALUE) {
-                            cur_pts = frm->pts * av_q2d(fctx->streams[audio_idx]->time_base);
-                        }
+            {
+                std::lock_guard<std::mutex> lk(pcm_mutex);
+                size_t cur_tf = pcm_data.size() / 2;
+                if (cur_tf == 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    continue;
+                }
 
-                        int samples = av_rescale_rnd(swr_get_delay(swr, cctx->sample_rate) +
-                                                      frm->nb_samples, out_rate, cctx->sample_rate, AV_ROUND_UP);
+                for (int i = 0; i < frames_to_render; ++i) {
+                    if (!rev && play_pos >= cur_tf) {
+                        if (decode_complete) { natural_eof = true; }
+                        break;
+                    }
+                    if (rev && play_pos < 0.0) {
+                        natural_eof = true;
+                        break;
+                    }
 
-                        if (samples > max_resample_buf) {
-                            max_resample_buf = samples;
-                            audio_buf.resize(max_resample_buf * 2);
-                        }
+                    double f = play_pos;
+                    int64_t i0 = static_cast<int64_t>(std::floor(f));
+                    if (i0 < 0) i0 = 0;
+                    if (static_cast<size_t>(i0) >= cur_tf) i0 = cur_tf - 1;
+                    int64_t i1 = (static_cast<size_t>(i0 + 1) < cur_tf) ? i0 + 1 : i0;
+                    double frac = f - std::floor(f);
 
-                        uint8_t* out_ptrs[1] = { reinterpret_cast<uint8_t*>(audio_buf.data()) };
-                        int converted = swr_convert(swr, out_ptrs, samples,
-                                                    (const uint8_t**)frm->extended_data, frm->nb_samples);
+                    int32_t l0 = pcm_data[i0 * 2];
+                    int32_t r0 = pcm_data[i0 * 2 + 1];
+                    int32_t l1 = pcm_data[i1 * 2];
+                    int32_t r1 = pcm_data[i1 * 2 + 1];
 
-                        if (converted > 0) {
-                            double v = is_muted.load() ? 0.0 : volume.load();
-                            for (int i = 0; i < converted * 2; ++i) {
-                                int32_t val = static_cast<int32_t>(audio_buf[i] * v);
-                                audio_buf[i] = static_cast<int16_t>(std::clamp(val, -32768, 32767));
-                            }
+                    int32_t l = static_cast<int32_t>(l0 + (l1 - l0) * frac);
+                    int32_t r = static_cast<int32_t>(r0 + (r1 - r0) * frac);
 
-                            if (!pcm) continue;
-                            int frames_left = converted;
-                            int16_t* p = audio_buf.data();
-                            while (frames_left > 0 && is_playing && !stop_requested) {
-                                snd_pcm_sframes_t written = snd_pcm_writei(pcm, p, frames_left);
-                                if (written < 0) {
-                                    written = snd_pcm_recover(pcm, written, 1);
-                                    if (written < 0) break;
-                                } else {
-                                    p += written * 2;
-                                    frames_left -= written;
-                                }
-                            }
-                        }
+                    l = static_cast<int32_t>(l * vol);
+                    r = static_cast<int32_t>(r * vol);
+
+                    alsa_out[rendered * 2]     = static_cast<int16_t>(std::clamp(l, -32768, 32767));
+                    alsa_out[rendered * 2 + 1] = static_cast<int16_t>(std::clamp(r, -32768, 32767));
+                    rendered++;
+
+                    if (!rev) {
+                        play_pos += spd;
+                    } else {
+                        play_pos -= spd;
                     }
                 }
             }
-            av_packet_unref(pkt);
+
+            cur_pts = std::clamp(play_pos / 44100.0, 0.0, duration.load());
+
+            if (pcm && rendered > 0) {
+                int frames_left = rendered;
+                int16_t* p = alsa_out.data();
+                while (frames_left > 0 && is_playing && !stop_requested) {
+                    snd_pcm_sframes_t written = snd_pcm_writei(pcm, p, frames_left);
+                    if (written < 0) {
+                        written = snd_pcm_recover(pcm, written, 1);
+                        if (written < 0) break;
+                    } else {
+                        p += written * 2;
+                        frames_left -= written;
+                    }
+                }
+            }
+
+            if (natural_eof) break;
         }
 
-        is_playing = false;
-        av_frame_free(&frm);
-        av_packet_free(&pkt);
-        swr_free(&swr);
-        avcodec_free_context(&cctx);
-        avformat_close_input(&fctx);
+        abort_decode = true;
+        if (dec_th.joinable()) dec_th.join();
 
+        is_playing = false;
         if (natural_eof && !stop_requested) {
             track_finished = true;
         }
@@ -522,8 +724,10 @@ public:
     bool need_redraw = true;
     bool need_status = true;
     bool is_searching = false;
+    bool is_command_mode = false;
     bool show_help = false;
     bool show_about = false;
+    bool show_del_confirm = false;
     PlayMode mode = PlayMode::NORMAL;
 
     int last_idx = -1;
@@ -535,6 +739,10 @@ public:
     int last_sixel_row = 0;
     int last_sixel_col = 0;
     static constexpr double RIGHT_FRAC = 0.40;
+
+    std::string del_target_name;
+    std::string del_target_path;
+    bool del_target_is_dir = false;
 
     MothApp() {
         initscr();
@@ -554,6 +762,7 @@ public:
         start_color();
         use_default_colors();
         init_pair(1, -1, -1);
+        init_pair(2, COLOR_WHITE, COLOR_RED);
 
         blank_sixel_seq = generate_blank_sixel(160, 160);
 
@@ -563,13 +772,9 @@ public:
 
     ~MothApp() {
         if (sixel_on_screen) {
-            int max_y, max_x;
-            getmaxyx(stdscr, max_y, max_x);
-            int right_w = static_cast<int>(max_x * RIGHT_FRAC);
-            if (right_w < 28) right_w = 28;
-            if (right_w > max_x - 22) right_w = max_x - 22;
-            int split_x = max_x - right_w;
-            if (split_x < 22) split_x = 22;
+            int max_x = getmaxx(stdscr);
+            int right_w = std::clamp(static_cast<int>(max_x * RIGHT_FRAC), 28, std::max(28, max_x - 22));
+            int split_x = std::max(22, max_x - right_w);
             std::cout << "\033[s\033[2;" << (split_x + 4) << "H"
                       << blank_sixel_seq << "\033[u" << std::flush;
         }
@@ -579,19 +784,19 @@ public:
     void scan() {
         entries.clear();
         if (path.has_parent_path() && path != path.parent_path()) {
-            entries.push_back({ "..", (path / "..").lexically_normal().string(), 1, 0, 0 });
+            entries.push_back({ "..", (path / "..").lexically_normal().string(), true, false });
         }
 
         std::vector<FileItem> dirs, regular;
         try {
             for (const auto& e : fs::directory_iterator(path)) {
                 if (e.is_directory()) {
-                    dirs.push_back({ e.path().filename().string(), e.path().string(), 1, 0, 0 });
+                    dirs.push_back({ e.path().filename().string(), e.path().string(), true, false });
                 } else {
                     std::string ext = e.path().extension().string();
                     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
                     if (ext == ".mp3" || ext == ".flac" || ext == ".wav" || ext == ".ogg" || ext == ".m4a") {
-                        regular.push_back({ e.path().filename().string(), e.path().string(), 0, 1, 0 });
+                        regular.push_back({ e.path().filename().string(), e.path().string(), false, true });
                     }
                 }
             }
@@ -602,8 +807,7 @@ public:
 
         entries.insert(entries.end(), dirs.begin(), dirs.end());
         entries.insert(entries.end(), regular.begin(), regular.end());
-        idx = 0;
-        scroll = 0;
+        if (idx >= static_cast<int>(entries.size())) idx = std::max(0, static_cast<int>(entries.size()) - 1);
         last_idx = -1;
         last_scroll = -1;
         need_redraw = true;
@@ -647,7 +851,7 @@ public:
         }
     }
 
-    std::string sec_to_str(double t) {
+    static std::string sec_to_str(double t) {
         int s = static_cast<int>(t);
         char b[16];
         snprintf(b, sizeof(b), "%02d:%02d", s / 60, s % 60);
@@ -666,11 +870,8 @@ public:
 
     PanelGeom compute_geom(int max_y, int max_x) const {
         PanelGeom g{};
-        int right_w = static_cast<int>(max_x * RIGHT_FRAC);
-        if (right_w < 28) right_w = 28;
-        if (right_w > max_x - 22) right_w = max_x - 22;
-        g.split_x = max_x - right_w;
-        if (g.split_x < 22) g.split_x = 22;
+        int right_w = std::clamp(static_cast<int>(max_x * RIGHT_FRAC), 28, std::max(28, max_x - 22));
+        g.split_x = std::max(22, max_x - right_w);
         g.side_w = max_x - g.split_x - 1;
 
         g.art_box_y = 1;
@@ -705,12 +906,9 @@ public:
         }
 
         if (meta.has_cover && !meta.sixel_art.empty()) {
-            int img_cols = 10;
-            if (meta.cover_w > 0)
-                img_cols = std::max(1, (meta.cover_w + 9) / 10);
+            int img_cols = meta.cover_w > 0 ? std::max(1, (meta.cover_w + 9) / 10) : 10;
             if (img_cols > area_cols) img_cols = area_cols;
-            int off_c = (area_cols - img_cols) / 2;
-            if (off_c < 0) off_c = 0;
+            int off_c = std::max(0, (area_cols - img_cols) / 2);
 
             const int row = base_row;
             const int col = base_col + off_c;
@@ -724,10 +922,9 @@ public:
             last_sixel_col = col;
             sixel_on_screen = true;
         } else {
-            const char* msg = "(No Artwork)";
             int msg_x = base_col + std::max(0, (area_cols - 13) / 2);
             int msg_y = base_row + std::max(0, art_rows / 2);
-            mvprintw(msg_y, msg_x, "%s", msg);
+            mvprintw(msg_y, msg_x, "(No Artwork)");
             last_sixel_w = 0;
             last_sixel_h = 0;
             last_sixel_row = 0;
@@ -737,8 +934,8 @@ public:
     }
 
     void draw_entry_line(int y, int entry_idx, int split_x, bool is_selected) {
-        move(y, 0);
         if (split_x <= 0) return;
+        move(y, 0);
 
         if (entry_idx >= 0 && entry_idx < static_cast<int>(entries.size())) {
             const auto& item = entries[entry_idx];
@@ -747,8 +944,8 @@ public:
 
             char prefix = item.is_dir ? '/' : ' ';
             int max_text_cols = std::max(0, split_x - 3);
-            std::string disp_name = truncate_utf8(item.name, max_text_cols);
-            int disp_w = utf8_display_width(disp_name);
+            int disp_w = 0;
+            std::string disp_name = truncate_utf8(item.name, max_text_cols, &disp_w);
             int pad = std::max(0, split_x - 2 - disp_w);
 
             mvprintw(y, 0, " %c%s%*s", prefix, disp_name.c_str(), pad, "");
@@ -760,7 +957,7 @@ public:
         }
     }
 
-    void draw_meta_line(int& meta_y, int split_x, int side_w, int max_y, const char* label, const std::string& val) {
+    static void draw_meta_line(int& meta_y, int split_x, int side_w, int max_y, const char* label, const std::string& val) {
         if (meta_y >= max_y - 2) return;
         move(meta_y, split_x + 2);
         clrtoeol();
@@ -776,7 +973,14 @@ public:
         move(y, 0);
         clrtoeol();
 
-        std::string status = audio.is_playing ? (audio.is_paused ? "PAUSED " : "PLAYING") : "STOPPED";
+        std::string status;
+        if (audio.is_playing) {
+            if (audio.is_paused) status = audio.is_reverse ? "PAUSED[REV]" : "PAUSED ";
+            else status = audio.is_reverse ? "REV-PLAY" : "PLAYING ";
+        } else {
+            status = audio.is_reverse ? "STOPPED[REV]" : "STOPPED";
+        }
+
         std::string mode_str = (mode == PlayMode::LOOP) ? "LOOP" : (mode == PlayMode::SEQUENTIAL ? "SEQ" : "NORMAL");
         int vol = static_cast<int>(audio.volume.load() * 100.0);
         int spd = static_cast<int>(std::round(audio.speed.load() * 100.0));
@@ -793,8 +997,7 @@ public:
                      sec_to_str(audio.cur_pts.load()).c_str(),
                      sec_to_str(audio.duration.load()).c_str(), vol, spd);
         }
-        std::string safe_stat = truncate_utf8(stat_buf, std::max(0, max_x - 3));
-        mvprintw(y, 1, "%s", safe_stat.c_str());
+        mvprintw(y, 1, "%.*s", std::max(0, max_x - 3), stat_buf);
         attroff(COLOR_PAIR(1) | A_REVERSE);
     }
 
@@ -802,25 +1005,33 @@ public:
         move(y, 0);
         clrtoeol();
 
-        if (is_searching) {
+        if (is_command_mode) {
+            std::string disp_cmd = truncate_utf8(command_query, std::max(0, max_x - 4));
+            mvprintw(y, 1, ":%s", disp_cmd.c_str());
+            int cur_x = 2 + utf8_display_width(disp_cmd);
+            if (cur_x < max_x - 1) move(y, cur_x);
+        } else if (is_searching) {
             std::string disp_query = truncate_utf8(search_query, std::max(0, max_x - 4));
             mvprintw(y, 1, "/%s", disp_query.c_str());
+            int cur_x = 2 + utf8_display_width(disp_query);
+            if (cur_x < max_x - 1) move(y, cur_x);
         } else {
             double dur = audio.duration.load();
             double ratio = (dur > 0.0) ? std::clamp(audio.cur_pts.load() / dur, 0.0, 1.0) : 0.0;
             int bar_w = std::max(4, max_x - 6);
             int filled = static_cast<int>(ratio * bar_w);
 
-            std::string bar;
-            bar.reserve(bar_w + 3);
-            bar.push_back('[');
-            bar.append(filled, '=');
-            if (filled < bar_w) {
-                bar.push_back('>');
-                bar.append(bar_w - filled - 1, '-');
+            mvaddch(y, 1, '[');
+            if (filled > 0) {
+                mvhline(y, 2, '=', filled);
             }
-            bar.push_back(']');
-            mvaddnstr(y, 1, bar.data(), static_cast<int>(bar.size()));
+            if (filled < bar_w) {
+                mvaddch(y, 2 + filled, audio.is_reverse ? '<' : '>');
+                if (bar_w - filled - 1 > 0) {
+                    mvhline(y, 2 + filled + 1, '-', bar_w - filled - 1);
+                }
+            }
+            mvaddch(y, 2 + bar_w, ']');
         }
     }
 
@@ -836,7 +1047,7 @@ public:
             return;
         }
 
-        if (show_help || show_about) attron(A_DIM);
+        if (show_help || show_about || show_del_confirm) attron(A_DIM);
 
         auto g = compute_geom(max_y, max_x);
         const int split_x = g.split_x;
@@ -847,7 +1058,6 @@ public:
         if (idx < scroll) scroll = idx;
         if (idx >= scroll + view_h) scroll = idx - view_h + 1;
 
-        // 1. Directory Header
         attron(COLOR_PAIR(1) | A_REVERSE);
         move(0, 0);
         clrtoeol();
@@ -856,7 +1066,6 @@ public:
         mvprintw(0, 1, "Browser: %s", header_path.c_str());
         attroff(COLOR_PAIR(1) | A_REVERSE);
 
-        // 2. Left panel - full list
         for (int i = 0; i < view_h; ++i) {
             int entry_idx = scroll + i;
             draw_entry_line(i + 1, entry_idx, split_x, entry_idx == idx);
@@ -864,28 +1073,28 @@ public:
         last_idx = idx;
         last_scroll = scroll;
 
-        // Vertical divider & Full clear of right panel
         for (int y = 1; y < max_y - 2; ++y) {
             move(y, split_x + 1);
             clrtoeol();
             mvaddch(y, split_x, ACS_VLINE);
         }
 
-        // 3. Right panel: Cover at top, Metadata at bottom
         TrackMetadata meta;
+        std::string cur_track_path;
         {
             std::lock_guard<std::mutex> lk(audio.meta_mutex);
             meta = audio.active_meta;
+            cur_track_path = audio.last_played_path;
         }
 
         mvprintw(g.art_box_y, split_x + 2, "[ META ]");
 
-        bool cover_changed = (audio.last_played_path != last_cover_path);
+        bool cover_changed = (cur_track_path != last_cover_path);
         if (cover_changed || audio.metadata_updated.load()) {
-            if (!show_help && !show_about) {
+            if (!show_help && !show_about && !show_del_confirm) {
                 emit_sixel(meta, split_x, g.art_box_y, g.art_rows, g.side_w);
             }
-            last_cover_path = audio.last_played_path;
+            last_cover_path = cur_track_path;
             audio.metadata_updated = false;
         }
 
@@ -898,16 +1107,17 @@ public:
         draw_meta_line(meta_y, split_x, g.side_w, max_y, "Bitrate:", std::to_string(meta.bit_rate / 1000) + " kb/s");
         draw_meta_line(meta_y, split_x, g.side_w, max_y, "Ch:",      std::to_string(meta.channels));
 
-        // 4 + 5. Status + progress
         draw_status(audio, max_x, max_y - 2);
         draw_progress_bar(audio, max_x, max_y - 1);
 
-        if (show_help || show_about) attroff(A_DIM);
+        if (show_help || show_about || show_del_confirm) attroff(A_DIM);
 
         if (show_help) {
             render_help_dialog(max_y, max_x);
         } else if (show_about) {
             render_about_dialog(max_y, max_x);
+        } else if (show_del_confirm) {
+            render_del_dialog(max_y, max_x);
         }
 
         refresh();
@@ -951,14 +1161,16 @@ public:
 
         if (audio.metadata_updated.load()) {
             TrackMetadata meta;
+            std::string cur_track_path;
             {
                 std::lock_guard<std::mutex> lk(audio.meta_mutex);
                 meta = audio.active_meta;
+                cur_track_path = audio.last_played_path;
             }
-            if (!show_help && !show_about) {
+            if (!show_help && !show_about && !show_del_confirm) {
                 emit_sixel(meta, split_x, g.art_box_y, g.art_rows, g.side_w);
             }
-            last_cover_path = audio.last_played_path;
+            last_cover_path = cur_track_path;
             audio.metadata_updated = false;
 
             int meta_y = g.meta_y;
@@ -975,6 +1187,8 @@ public:
             render_help_dialog(max_y, max_x);
         } else if (show_about) {
             render_about_dialog(max_y, max_x);
+        } else if (show_del_confirm) {
+            render_del_dialog(max_y, max_x);
         }
 
         refresh();
@@ -991,9 +1205,44 @@ public:
         }
     }
 
-    void render_help_dialog(int max_y, int max_x) {
+    void render_del_dialog(int max_y, int max_x) {
         int dlg_w = std::min(60, max_x - 4);
-        int dlg_h = std::min(22, max_y - 2);
+        int dlg_h = 9;
+        int top_y = (max_y - dlg_h) / 2;
+        int left_x = (max_x - dlg_w) / 2;
+
+        attron(COLOR_PAIR(2) | A_BOLD);
+        for (int y = 0; y < dlg_h; ++y) {
+            move(top_y + y, left_x);
+            for (int x = 0; x < dlg_w; ++x) {
+                if (y == 0 && x == 0) addch(ACS_ULCORNER);
+                else if (y == 0 && x == dlg_w - 1) addch(ACS_URCORNER);
+                else if (y == dlg_h - 1 && x == 0) addch(ACS_LLCORNER);
+                else if (y == dlg_h - 1 && x == dlg_w - 1) addch(ACS_LRCORNER);
+                else if (y == 0 || y == dlg_h - 1) addch(ACS_HLINE);
+                else if (x == 0 || x == dlg_w - 1) addch(ACS_VLINE);
+                else addch(' ');
+            }
+        }
+
+        mvprintw(top_y, left_x + (dlg_w - 17) / 2, " CONFIRM DELETE ");
+        attroff(COLOR_PAIR(2) | A_BOLD);
+
+        std::string q = "Are you sure you wanna del this file?";
+        mvprintw(top_y + 2, left_x + (dlg_w - static_cast<int>(q.length())) / 2, "%s", q.c_str());
+
+        std::string disp_name = truncate_utf8(del_target_name, dlg_w - 8);
+        attron(A_BOLD);
+        mvprintw(top_y + 4, left_x + (dlg_w - static_cast<int>(disp_name.length()) - 4) / 2, "> %s <", disp_name.c_str());
+        attroff(A_BOLD);
+
+        std::string prompt = "[Y] Yes, Delete!     [N / Esc] Cancel";
+        mvprintw(top_y + 6, left_x + (dlg_w - static_cast<int>(prompt.length())) / 2, "%s", prompt.c_str());
+    }
+
+    static void render_help_dialog(int max_y, int max_x) {
+        int dlg_w = std::min(64, max_x - 4);
+        int dlg_h = std::min(24, max_y - 2);
         int top_y = (max_y - dlg_h) / 2;
         int left_x = (max_x - dlg_w) / 2;
 
@@ -1028,24 +1277,26 @@ public:
         draw_help_item("Space", "Play / Enter Directory");
         draw_help_item("Backspace", "Go to Parent Directory");
         draw_help_item("p / c", "Pause / Resume");
+        draw_help_item("r", "Toggle Reverse Playback");
+        draw_help_item(":", "Vim Cmd (:speed, :vol, :seek, :del)");
         draw_help_item("v", "Stop playback");
         draw_help_item("m", "Toggle Mute");
         draw_help_item("Left / Right", "Seek -3s / +3s");
         draw_help_item("S-Left / S-Right", "Seek -1s / +1s");
         draw_help_item("0 - 9", "Instant Seek 0% - 90%");
-        draw_help_item("[ / ]", "Varispeed -10% / +10%");
+        draw_help_item("[ / ]", "Varispeed -5% / +5%");
         draw_help_item("{ / }", "Varispeed -1% / +1%");
         draw_help_item("l / s / f", "Loop / Sequential / Normal");
         draw_help_item("PgUp / PgDn", "Scroll 5 items");
         draw_help_item("g / G", "Jump to Top / Bottom");
         draw_help_item("Mouse Wheel", "Smooth Up / Down scroll");
-        draw_help_item("/ | SHIFT+/", "Find track | Next match");
-        draw_help_item("Home", "Reset Vol & Speed");
+        draw_help_item("/ | ?", "Find track | Next match");
+        draw_help_item("Home", "Reset Modifiers");
         draw_help_item("F1 / Esc", "Close Help");
         draw_help_item("F2", "About");
     }
 
-    void render_about_dialog(int max_y, int max_x) {
+    static void render_about_dialog(int max_y, int max_x) {
         int dlg_w = std::min(56, max_x - 4);
         int dlg_h = std::min(15, max_y - 2);
         int top_y = (max_y - dlg_h) / 2;
@@ -1087,6 +1338,143 @@ public:
         line(APP_V);
     }
 
+    void execute_cmd(const std::string& line, AudioEngine& audio, bool& running) {
+        std::string trimmed = trim_str(line);
+        if (trimmed.empty()) return;
+
+        std::string cmd, args;
+        size_t sp = trimmed.find_first_of(" \t");
+        if (sp != std::string::npos) {
+            cmd = trimmed.substr(0, sp);
+            args = trim_str(trimmed.substr(sp + 1));
+        } else {
+            cmd = trimmed;
+        }
+        std::transform(cmd.begin(), cmd.end(), cmd.begin(), ::tolower);
+
+        if (cmd == "q" || cmd == "quit" || cmd == "exit") {
+            running = false;
+        } else if (cmd == "speed" || cmd == "spd") {
+            if (!args.empty()) {
+                double val = 1.0;
+                try {
+                    if (args.back() == '%') {
+                        val = std::stod(args.substr(0, args.size() - 1)) / 100.0;
+                    } else {
+                        val = std::stod(args);
+                        if (val > 3.0 && val <= 300.0) val /= 100.0;
+                    }
+                    audio.speed = std::clamp(val, 0.10, 3.0);
+                } catch (...) {}
+            }
+        } else if (cmd == "vol" || cmd == "volume" || cmd == "v") {
+            if (!args.empty()) {
+                double val = 1.0;
+                try {
+                    if (args.back() == '%') {
+                        val = std::stod(args.substr(0, args.size() - 1)) / 100.0;
+                    } else {
+                        val = std::stod(args);
+                        if (val > 2.0 && val <= 200.0) val /= 100.0;
+                    }
+                    audio.volume = std::clamp(val, 0.0, 2.0);
+                    audio.is_muted = false;
+                } catch (...) {}
+            }
+        } else if (cmd == "seek" || cmd == "seeking" || cmd == "s") {
+            if (!args.empty()) {
+                try {
+                    if (args.front() == '+' || args.front() == '-') {
+                        double delta = std::stod(args);
+                        audio.seek_relative(delta);
+                    } else if (args.back() == '%') {
+                        double pct = std::stod(args.substr(0, args.size() - 1)) / 100.0;
+                        audio.seek_absolute_percent(pct);
+                    } else if (args.find(':') != std::string::npos) {
+                        size_t colon = args.find(':');
+                        int m = std::stoi(args.substr(0, colon));
+                        double s = std::stod(args.substr(colon + 1));
+                        double target = m * 60 + s;
+                        if (audio.duration.load() > 0.0) {
+                            audio.seek_req = std::clamp(target, 0.0, audio.duration.load());
+                        }
+                    } else {
+                        double s = std::stod(args);
+                        if (audio.duration.load() > 0.0) {
+                            audio.seek_req = std::clamp(s, 0.0, audio.duration.load());
+                        }
+                    }
+                } catch (...) {}
+            }
+        } else if (cmd == "reversing" || cmd == "reverse" || cmd == "rev") {
+            if (args.empty()) {
+                audio.toggle_reverse();
+            } else {
+                std::string a = args;
+                std::transform(a.begin(), a.end(), a.begin(), ::tolower);
+                if (a == "on" || a == "1" || a == "true") audio.is_reverse = true;
+                else if (a == "off" || a == "0" || a == "false") audio.is_reverse = false;
+                else audio.toggle_reverse();
+            }
+        } else if (cmd == "del" || cmd == "delete" || cmd == "rm") {
+            if (!entries.empty() && idx >= 0 && idx < static_cast<int>(entries.size())) {
+                if (entries[idx].name != "..") {
+                    flash();
+                    int max_y, max_x;
+                    getmaxyx(stdscr, max_y, max_x);
+                    attron(COLOR_PAIR(2));
+                    for (int y = 0; y < max_y; ++y) {
+                        mvhline(y, 0, ' ', max_x);
+                    }
+                    attroff(COLOR_PAIR(2));
+                    refresh();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
+                    show_del_confirm = true;
+                    del_target_name = entries[idx].name;
+                    del_target_path = entries[idx].path;
+                    del_target_is_dir = entries[idx].is_dir;
+                    last_cover_path.clear();
+                    sixel_on_screen = false;
+                }
+            }
+        } else if (cmd == "rename" || cmd == "mv") {
+            if (!args.empty() && !entries.empty() && idx >= 0 && idx < static_cast<int>(entries.size())) {
+                if (entries[idx].name != "..") {
+                    std::string new_name = args;
+                    if (new_name.front() == '"' && new_name.back() == '"' && new_name.size() >= 2) {
+                        new_name = new_name.substr(1, new_name.size() - 2);
+                    } else if (new_name.front() == '\'' && new_name.back() == '\'' && new_name.size() >= 2) {
+                        new_name = new_name.substr(1, new_name.size() - 2);
+                    }
+                    fs::path clean_p(new_name);
+                    std::string clean_name = clean_p.filename().string();
+                    if (!clean_name.empty()) {
+                        fs::path old_p = entries[idx].path;
+                        fs::path new_p = old_p.parent_path() / clean_name;
+                        std::error_code ec;
+                        fs::rename(old_p, new_p, ec);
+                        if (!ec) {
+                            if (audio.last_played_path == old_p.string()) {
+                                std::lock_guard<std::mutex> lk(audio.meta_mutex);
+                                audio.last_played_path = new_p.string();
+                            }
+                            scan();
+                            for (size_t i = 0; i < entries.size(); ++i) {
+                                if (entries[i].name == clean_name) {
+                                    idx = static_cast<int>(i);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (cmd == "help" || cmd == "h") {
+            show_help = true;
+        }
+    }
+
     void handle_input(AudioEngine& audio, bool& running) {
         int ch = getch();
         if (ch == ERR) return;
@@ -1097,6 +1485,65 @@ public:
             last_cover_path.clear();
             sixel_on_screen = false;
             need_redraw = true;
+            return;
+        }
+
+        if (show_del_confirm) {
+            if (ch == 'y' || ch == 'Y' || ch == 10 || ch == 13 || ch == KEY_ENTER) {
+                if (audio.last_played_path == del_target_path) {
+                    audio.stop();
+                }
+                std::error_code ec;
+                if (del_target_is_dir) fs::remove_all(del_target_path, ec);
+                else fs::remove(del_target_path, ec);
+
+                show_del_confirm = false;
+                last_cover_path.clear();
+                sixel_on_screen = false;
+                scan();
+                need_redraw = true;
+                return;
+            }
+            if (ch == 'n' || ch == 'N' || ch == 27 || ch == 'q' || ch == 'Q') {
+                show_del_confirm = false;
+                need_redraw = true;
+                return;
+            }
+            return;
+        }
+
+        if (is_command_mode) {
+            if (ch == 27) {
+                is_command_mode = false;
+                command_query.clear();
+                curs_set(0);
+                need_redraw = true;
+                return;
+            }
+            if (ch == 10 || ch == 13 || ch == KEY_ENTER) {
+                is_command_mode = false;
+                curs_set(0);
+                execute_cmd(command_query, audio, running);
+                command_query.clear();
+                need_redraw = true;
+                return;
+            }
+            if (ch == KEY_BACKSPACE || ch == 127 || ch == '\b') {
+                if (!command_query.empty()) {
+                    command_query.pop_back();
+                } else {
+                    is_command_mode = false;
+                    curs_set(0);
+                    need_redraw = true;
+                }
+                need_status = true;
+                return;
+            }
+            if (ch >= 32 && ch <= 126) {
+                command_query += static_cast<char>(ch);
+                need_status = true;
+                return;
+            }
             return;
         }
 
@@ -1119,7 +1566,7 @@ public:
         }
 
         if (show_help || show_about) {
-            if (ch == 27 || ch == 'q' || ch == ' ' || ch == 10) {
+            if (ch == 27 || ch == 'q' || ch == ' ' || ch == 10 || ch == 13 || ch == KEY_ENTER) {
                 show_help = false;
                 show_about = false;
                 last_cover_path.clear();
@@ -1136,7 +1583,7 @@ public:
                 need_redraw = true;
                 return;
             }
-            if (ch == 10 || ch == ' ') {
+            if (ch == 10 || ch == 13 || ch == KEY_ENTER) {
                 is_searching = false;
                 curs_set(0);
                 if (!search_query.empty()) {
@@ -1176,11 +1623,7 @@ public:
                 if (ev.bstate & (BUTTON1_CLICKED | BUTTON1_PRESSED)) {
                     int max_y, max_x;
                     getmaxyx(stdscr, max_y, max_x);
-                    int right_w = static_cast<int>(max_x * RIGHT_FRAC);
-                    if (right_w < 28) right_w = 28;
-                    if (right_w > max_x - 22) right_w = max_x - 22;
-                    int split_x = max_x - right_w;
-                    if (split_x < 22) split_x = 22;
+                    auto g = compute_geom(max_y, max_x);
                     int view_h = max_y - 3;
                     int bot_y = max_y - 1;
                     int bar_w = std::max(4, max_x - 6);
@@ -1192,7 +1635,7 @@ public:
                         return;
                     }
 
-                    if (ev.y >= 1 && ev.y <= view_h && ev.x < split_x) {
+                    if (ev.y >= 1 && ev.y <= view_h && ev.x < g.split_x) {
                         int clicked = scroll + (ev.y - 1);
                         if (clicked < static_cast<int>(entries.size())) {
                             idx = clicked;
@@ -1210,6 +1653,14 @@ public:
                     }
                 }
             }
+            return;
+        }
+
+        if (ch == ':') {
+            is_command_mode = true;
+            command_query.clear();
+            curs_set(1);
+            need_status = true;
             return;
         }
 
@@ -1236,6 +1687,11 @@ public:
         switch (ch) {
             case 'q': case 'Q':
                 running = false;
+                break;
+
+            case 'r': case 'R':
+                audio.toggle_reverse();
+                need_status = true;
                 break;
 
             case KEY_BACKSPACE:
@@ -1367,6 +1823,7 @@ private:
     std::string blank_sixel_seq;
     std::string search_query;
     std::string last_query;
+    std::string command_query;
     int idx = 0;
     int scroll = 0;
 };
@@ -1383,6 +1840,7 @@ int main() {
     bool last_playing = false;
     bool last_paused = false;
     bool last_muted = false;
+    bool last_reverse = false;
     double last_vol = -1.0;
     double last_spd = -1.0;
 
@@ -1402,6 +1860,7 @@ int main() {
         bool cur_playing = audio.is_playing.load();
         bool cur_paused  = audio.is_paused.load();
         bool cur_muted   = audio.is_muted.load();
+        bool cur_reverse = audio.is_reverse.load();
         double cur_pts   = audio.cur_pts.load();
         double cur_vol   = audio.volume.load();
         double cur_spd   = audio.speed.load();
@@ -1410,6 +1869,7 @@ int main() {
         bool state_changed = (cur_playing != last_playing) ||
                              (cur_paused  != last_paused)  ||
                              (cur_muted   != last_muted)   ||
+                             (cur_reverse != last_reverse) ||
                              (std::abs(cur_vol - last_vol) > 0.001) ||
                              (std::abs(cur_spd - last_spd) > 0.001) ||
                              audio.metadata_updated.load();
@@ -1420,6 +1880,7 @@ int main() {
             last_playing = cur_playing;
             last_paused  = cur_paused;
             last_muted   = cur_muted;
+            last_reverse = cur_reverse;
             last_vol     = cur_vol;
             last_spd     = cur_spd;
         }
