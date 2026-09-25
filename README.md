@@ -43,4 +43,4 @@ vim mode :rename,del,seek,rev,vol,spd
 ![](./media/2.png)
 ![](./media/3.png)
 
-![x11version](./media/3.png)
+![x11version](./media/4.png)
