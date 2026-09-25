@@ -1,5 +1,5 @@
 # Mothplayer
-Fast tui music player inspired by cmus with extra beautiful features
+Fast tui/gui music player inspired by cmus with extra beautiful features
 
 # Features
 blazingly fast tui music player\
@@ -11,11 +11,13 @@ supported container format
 - wav
 
 keys mapped (hotkeys for everything) F1 to print all\
-varispeed control
+Varispeed control
+Reverse playing
+vim mode :rename,del,seek,rev,vol,spd
 
 ## Metadata support
 
-- Cover image (sixel)
+- Cover image (sixel/tui) (raw/x11)
 - Title
 - Artist
 - Album
@@ -40,3 +42,5 @@ varispeed control
 ![](./media/1.png)
 ![](./media/2.png)
 ![](./media/3.png)
+
+![x11version](./media/3.png)
