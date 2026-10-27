@@ -1,23 +1,39 @@
-CXX      := g++
-TARGET   := mothplayer
-SRC      := src/main.cpp
-VERSION := $(shell cat V)
-CXXSTD   ?= c++20
+APP      := mothplayer
+SRC      := main.cpp audio.cpp ui.cpp
+OBJ      := $(SRC:.cpp=.o)
+DEP      := $(OBJ:.o=.d)
 
-CXXFLAGS := -std=$(CXXSTD) -O3 -march=native -mtune=native \
-            -flto=auto -fno-plt -fomit-frame-pointer \
-            -funroll-loops -pipe -Wall -Wextra
-CXXFLAGS += -DAPP_V=\"$(VERSION)\"
+CXX      ?= g++
+PKGCONF  ?= pkg-config
 
-LDFLAGS  := -flto=auto -s
-LDLIBS   := -lncurses -lasound -lavformat -lavcodec -lswresample -lswscale -lavutil -lsixel -lpthread
+# Dependencies (ncursesw for UTF-8 support)
+PKGS := ncursesw libsixel alsa libavformat libavcodec libswresample libswscale libavutil
 
-.PHONY: all clean
+PKG_CFLAGS := $(shell $(PKGCONF) --cflags $(PKGS))
+PKG_LIBS   := $(shell $(PKGCONF) --libs $(PKGS))
 
-all: $(TARGET)
+OPTFLAGS := -O3 -march=native -flto -fno-plt -fomit-frame-pointer -pipe
+WARNFLAGS := -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
 
-$(TARGET): $(SRC)
-	$(CXX) $(CXXFLAGS) $(SRC) -o $(TARGET) $(LDFLAGS) $(LDLIBS)
+CXXFLAGS += -std=c++20 $(OPTFLAGS) $(WARNFLAGS) -DNDEBUG -MMD -MP -pthread $(PKG_CFLAGS)
+LDFLAGS  += -flto -pthread -Wl,-O2 -Wl,--as-needed -Wl,--gc-sections
+
+.PHONY: all clean run
+
+all: $(APP)
+
+$(APP): $(OBJ)
+	@echo "  LD      $@"
+	@$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(PKG_LIBS)
+
+%.o: %.cpp
+	@echo "  CXX     $<"
+	@$(CXX) $(CXXFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(TARGET)
+	@rm -f $(OBJ) $(APP) $(DEP)
+
+run: $(APP)
+	@./$(APP)
+
+-include $(DEP)
