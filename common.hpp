@@ -31,7 +31,8 @@ struct TrackMetadata {
     int64_t bit_rate = 0;
     int sample_rate = 0;
     int channels = 0;
-    std::string sixel_art;
+    
+    std::vector<uint8_t> cover_rgb; 
     bool has_cover = false;
     int cover_w = 0;
     int cover_h = 0;

@@ -1,6 +1,5 @@
 #include "audio.hpp"
 #include <alsa/asoundlib.h>
-#include <sixel.h>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -11,35 +10,6 @@ extern "C" {
 }
 
 static void silent_alsa_handler(const char*, int, const char*, int, const char*, ...) {}
-
-static int sixel_write_callback(char* data, int size, void* priv) {
-    auto* buf = static_cast<std::string*>(priv);
-    buf->append(data, size);
-    return size;
-}
-
-std::string encode_rgb_to_sixel_libsixel(uint8_t* rgb_data, int w, int h) {
-    if (!rgb_data || w <= 0 || h <= 0) return "";
-    std::string sixel_buffer;
-    sixel_output_t* output = nullptr;
-    sixel_dither_t* dither = nullptr;
-
-    if (SIXEL_FAILED(sixel_output_new(&output, sixel_write_callback, &sixel_buffer, nullptr))) return "";
-    if (SIXEL_FAILED(sixel_dither_new(&dither, 256, nullptr))) {
-        sixel_output_unref(output);
-        return "";
-    }
-    if (SIXEL_FAILED(sixel_dither_initialize(dither, rgb_data, w, h, SIXEL_PIXELFORMAT_RGB888, LARGE_AUTO, REP_AUTO, QUALITY_HIGH))) {
-        sixel_dither_unref(dither);
-        sixel_output_unref(output);
-        return "";
-    }
-
-    sixel_encode(rgb_data, w, h, 3, dither, output);
-    sixel_dither_unref(dither);
-    sixel_output_unref(output);
-    return sixel_buffer;
-}
 
 AudioEngine::AudioEngine() {
     snd_lib_error_set_handler(silent_alsa_handler);
@@ -81,7 +51,7 @@ void AudioEngine::stop() {
 
     if (pcm) {
         snd_pcm_t* p = (snd_pcm_t*)pcm;
-        snd_pcm_drop(p); // Leaves ALSA in SETUP state, prepare() in decode_loop wakes it up.
+        snd_pcm_drop(p);
     }
 
     {
@@ -117,6 +87,10 @@ void AudioEngine::reset_modifiers() {
     speed = 1.0;
     is_muted = false;
     is_reverse = false;
+    
+    // Reset A-B Loop
+    ab_a = -1.0;
+    ab_b = -1.0;
 }
 
 void AudioEngine::extract_album_art_async(const std::string& path, int target_w, int target_h, uint64_t my_gen) {
@@ -127,7 +101,7 @@ void AudioEngine::extract_album_art_async(const std::string& path, int target_w,
         return;
     }
 
-    std::string sixel;
+    std::vector<uint8_t> rgb; // Raw RGB data
     bool has_cover = false;
     int cover_out_w = 0, cover_out_h = 0;
 
@@ -157,13 +131,12 @@ void AudioEngine::extract_album_art_async(const std::string& path, int target_w,
                                                      out_w, out_h, AV_PIX_FMT_RGB24,
                                                      SWS_LANCZOS, nullptr, nullptr, nullptr);
                     if (sws) {
-                        std::vector<uint8_t> rgb(out_w * out_h * 3);
+                        rgb.assign(out_w * out_h * 3, 0);
                         uint8_t* dst[1] = { rgb.data() };
                         int strides[1] = { out_w * 3 };
                         sws_scale(sws, vframe->data, vframe->linesize, 0, src_h, dst, strides);
-                        sixel = encode_rgb_to_sixel_libsixel(rgb.data(), out_w, out_h);
-                        has_cover = !sixel.empty();
                         sws_freeContext(sws);
+                        has_cover = true;
                         cover_out_w = out_w;
                         cover_out_h = out_h;
                     }
@@ -180,7 +153,8 @@ void AudioEngine::extract_album_art_async(const std::string& path, int target_w,
 
     std::lock_guard<std::mutex> lk(meta_mutex);
     if (last_played_path != path) return;
-    active_meta.sixel_art = std::move(sixel);
+    
+    active_meta.cover_rgb = std::move(rgb); // Store raw pixels
     active_meta.has_cover = has_cover;
     active_meta.cover_w = cover_out_w;
     active_meta.cover_h = cover_out_h;
@@ -359,7 +333,7 @@ void AudioEngine::decode_loop(const std::string& path) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
-    // FIX: Reset ALSA device if it was left in SETUP state (e.g. after :del or 'v' stop)
+    // Reset ALSA device if it was left in SETUP state
     if (pcm) snd_pcm_prepare((snd_pcm_t*)pcm);
 
     is_playing = true;
@@ -395,6 +369,20 @@ void AudioEngine::decode_loop(const std::string& path) {
         double vol = is_muted.load() ? 0.0 : volume.load();
 
         size_t tf = total_frames.load();
+        
+        // A-B Loop Logic
+        double a = ab_a.load();
+        double b = ab_b.load();
+        if (!rev && a >= 0.0 && b > 0.0) {
+            if (play_pos >= b * 44100.0) {
+                play_pos = a * 44100.0;
+            }
+        } else if (rev && a >= 0.0 && b > 0.0) {
+            if (play_pos <= a * 44100.0) {
+                play_pos = b * 44100.0;
+            }
+        }
+
         if (!rev) {
             if (play_pos >= tf) {
                 if (decode_complete) { natural_eof = true; break; }
@@ -454,6 +442,7 @@ void AudioEngine::decode_loop(const std::string& path) {
                 if (written < 0) {
                     written = snd_pcm_recover(p, written, 1);
                     if (written < 0) {
+                        // Last-ditch recovery: full close/reopen.
                         snd_pcm_close(p);
                         pcm = nullptr;
                         snd_pcm_t* new_p = nullptr;

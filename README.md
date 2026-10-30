@@ -11,9 +11,10 @@ supported container format
 - wav
 
 keys mapped (hotkeys for everything) F1 to print all\
-Varispeed control
-Reverse playing
-vim mode :rename,del,seek,rev,vol,spd
+Varispeed control\
+Reverse playing\
+vim mode :rename,del,seek,rev,vol,spd\
+A-B loop
 
 ## Metadata support
 

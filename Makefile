@@ -2,6 +2,8 @@ APP      := mothplayer
 SRC      := main.cpp audio.cpp ui.cpp
 OBJ      := $(SRC:.cpp=.o)
 DEP      := $(OBJ:.o=.d)
+BUILD_DATE := $(shell date -r main.cpp '+%Y.%m' 2>/dev/null || date '+%Y.%m')
+
 
 CXX      ?= g++
 PKGCONF  ?= pkg-config
@@ -15,7 +17,7 @@ PKG_LIBS   := $(shell $(PKGCONF) --libs $(PKGS))
 OPTFLAGS := -O3 -march=native -flto -fno-plt -fomit-frame-pointer -pipe
 WARNFLAGS := -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
 
-CXXFLAGS += -std=c++20 $(OPTFLAGS) $(WARNFLAGS) -DNDEBUG -MMD -MP -pthread $(PKG_CFLAGS)
+CXXFLAGS += -std=c++20 $(OPTFLAGS) $(WARNFLAGS) -DNDEBUG -MMD -MP -pthread $(PKG_CFLAGS) -DAPP_VERSION=\"$(BUILD_DATE)\"
 LDFLAGS  += -flto -pthread -Wl,-O2 -Wl,--as-needed -Wl,--gc-sections
 
 .PHONY: all clean run
